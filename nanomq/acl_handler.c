@@ -2,6 +2,20 @@
 #include "include/acl_handler.h"
 #include "nng/protocol/mqtt/mqtt_parser.h"
 #include "nng/supplemental/nanolib/log.h"
+#include "nng/supplemental/util/platform.h"
+
+// The ACL (config->acl) is read lock-free on the hot path (auth_acl) by every
+// publish/subscribe, and rewritten wholesale on `nanomq reload`. Guard both
+// with a single rwlock: readers take a shared rdlock while traversing the
+// rules, the reload takes the exclusive wrlock while it frees the old rules
+// and swaps in the new ones. This closes the use-after-free between a reader
+// walking config->acl.rules and reload freeing that array.
+static nng_rwlock *acl_rwlock = NULL;
+
+// util/platform.h declares the write lock as nng_rwlock_rwlock, but libnng
+// actually exports it as nng_rwlock_wrlock. Declare the real symbol here so we
+// do not have to patch the nng submodule header.
+extern void nng_rwlock_wrlock(nng_rwlock *);
 
 // only clientid and username are supported now.
 #define placeholder_clientid "${clientid}"
@@ -118,6 +132,9 @@ auth_acl(conf *config, acl_action_type act_type, conn_param *param,
 	bool match     = false;
 	bool sub_match = true;
 	bool result    = false;
+
+	if (acl_rwlock != NULL)
+		nng_rwlock_rdlock(acl_rwlock);
 
 	for (size_t i = 0; i < acl->rule_count; i++) {
 		acl_rule *      rule   = acl->rules[i];
@@ -253,6 +270,8 @@ auth_acl(conf *config, acl_action_type act_type, conn_param *param,
 			for (size_t j = 0; j < rule->topic_count && found != true; j++) {
 				rule_topic = replace_topic(rule->topics[j], param);
 				if (rule_topic == NULL) {
+					if (acl_rwlock != NULL)
+						nng_rwlock_unlock(acl_rwlock);
 					conn_param_free(param);
 					return false;
 				}
@@ -285,6 +304,9 @@ auth_acl(conf *config, acl_action_type act_type, conn_param *param,
 		break;
 	}
 
+	if (acl_rwlock != NULL)
+		nng_rwlock_unlock(acl_rwlock);
+
 	conn_param_free(param);
 
 	if (match) {
@@ -292,5 +314,42 @@ auth_acl(conf *config, acl_action_type act_type, conn_param *param,
 	} else {
 		return config->acl_nomatch == ACL_ALLOW ? true : result;
 	}
+}
+
+void
+nmq_acl_lock_init(void)
+{
+	if (acl_rwlock == NULL) {
+		if (nng_rwlock_alloc(&acl_rwlock) != 0) {
+			log_error("failed to allocate ACL rwlock; "
+			          "ACL reload will be disabled");
+			acl_rwlock = NULL;
+		}
+	}
+}
+
+void
+reload_acl_config(conf_acl *cur, conf_acl *new)
+{
+	if (acl_rwlock != NULL)
+		nng_rwlock_wrlock(acl_rwlock);
+
+	// Free the currently live rules (and their contents) while holding the
+	// write lock, so no reader can be traversing them. conf_acl_destroy
+	// leaves cur->rules == NULL and cur->rule_count == 0.
+	conf_acl_destroy(cur);
+
+	// Move the freshly parsed rules into the live config.
+	cur->enable     = new->enable;
+	cur->rule_count = new->rule_count;
+	cur->rules      = new->rules;
+
+	// Detach the moved rules from new so conf_fini(new_conf) does not
+	// double-free them.
+	new->rule_count = 0;
+	new->rules      = NULL;
+
+	if (acl_rwlock != NULL)
+		nng_rwlock_unlock(acl_rwlock);
 }
 #endif

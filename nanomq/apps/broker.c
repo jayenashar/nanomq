@@ -950,6 +950,12 @@ broker(conf *nanomq_conf)
 	nanomq_conf->total_ctx = nanomq_conf->parallel;		// match with num of aio
 	num_work = nanomq_conf->parallel;					// match with num of works
 
+#ifdef ACL_SUPP
+	// Initialize the ACL rwlock once, before any worker context can call
+	// auth_acl, so `nanomq reload` can swap the ACL without racing readers.
+	nmq_acl_lock_init();
+#endif
+
 
 #if defined(SUPP_RULE_ENGINE)
 	conf_rule *cr = &nanomq_conf->rule_eng;
