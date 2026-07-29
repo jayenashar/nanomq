@@ -2,6 +2,8 @@
 import subprocess
 import shlex
 import os
+import socket
+import struct
 from multiprocessing import Process, Value
 import time
 import threading
@@ -229,6 +231,119 @@ def test_topic_alias():
         return False
 
 
+def mqtt_varint(n):
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            return bytes(out)
+
+
+def mqtt_packet(header, body):
+    return bytes([header]) + mqtt_varint(len(body)) + body
+
+
+def mqtt_utf8(s):
+    b = s.encode()
+    return struct.pack("!H", len(b)) + b
+
+
+def mqtt_read_packet_type(sock):
+    header = sock.recv(1)
+    if not header:
+        raise ConnectionError("broker closed the connection")
+    remaining = 0
+    multiplier = 1
+    while True:
+        b = sock.recv(1)
+        if not b:
+            raise ConnectionError("broker closed the connection")
+        remaining += (b[0] & 0x7F) * multiplier
+        multiplier *= 128
+        if not b[0] & 0x80:
+            break
+    body = b""
+    while len(body) < remaining:
+        chunk = sock.recv(remaining - len(body))
+        if not chunk:
+            raise ConnectionError("broker closed the connection")
+        body += chunk
+    return header[0] >> 4
+
+
+def publish_with_topic_alias(topic, alias, payload, count):
+    """Publish count QoS 1 messages over one MQTT v5 connection. The first
+    carries the topic name and registers the alias, the rest carry the alias
+    and an empty topic name, so the broker has to resolve them. Neither
+    mosquitto_pub nor paho can send an empty topic name, hence the raw
+    socket."""
+    sock = socket.create_connection((g_addr, g_port), timeout=10)
+    try:
+        connect = mqtt_utf8("MQTT") + bytes([5, 0x02]) + struct.pack("!H", 60)
+        connect += mqtt_varint(0) + mqtt_utf8("alias-resolution-pub")
+        sock.sendall(mqtt_packet(0x10, connect))
+        if mqtt_read_packet_type(sock) != 2:
+            raise RuntimeError("expected CONNACK")
+
+        properties = bytes([0x23]) + struct.pack("!H", alias)
+        for i in range(count):
+            name = topic if i == 0 else ""
+            body = mqtt_utf8(name) + struct.pack("!H", i + 1)
+            body += mqtt_varint(len(properties)) + properties + payload
+            sock.sendall(mqtt_packet(0x32, body))
+            if mqtt_read_packet_type(sock) != 4:
+                raise RuntimeError("expected PUBACK")
+    finally:
+        sock.close()
+
+
+def test_topic_alias_resolution():
+    # test_topic_alias only ever registers aliases, because mosquitto_pub
+    # sends the topic name on every publish. This covers the other half:
+    # publishing with the alias alone and letting the broker resolve it.
+    s_cmd = g_sub + g_url + "-t 'alias_resolution' -q 1"
+    sub_cmd = shlex.split(s_cmd)
+
+    cnt = Value('i', 0)
+    pid = Value('i', 0)
+    process1 = Process(target=cnt_message, args=(sub_cmd, cnt, pid, "message"))
+    process1.start()
+    time.sleep(1)
+
+    failure = None
+    try:
+        publish_with_topic_alias("alias_resolution", 10, b"message", 3)
+    except (OSError, RuntimeError) as e:
+        failure = e
+
+    times = 0
+    while True:
+        if cnt.value == 3 or times == 3:
+            break
+        time.sleep(2)
+        times += 1
+
+    time.sleep(2)
+    process1.terminate()
+    if pid.value:
+        os.kill(pid.value, signal.SIGKILL)
+
+    if failure is not None:
+        print("Topic alias resolution publisher failed:", failure)
+    if cnt.value == 3:
+        print("Topic alias resolution test passed!")
+        return True
+    else:
+        print("Sub client did not receive message * 3, only", cnt.value, "received")
+        print(s_cmd)
+        print("Topic alias resolution test failed!")
+        return False
+
+
 
 def test_user_property():
     s_cmd = g_sub + g_url + "-t 'topic_test' -V 5 -F %P"
@@ -406,5 +521,5 @@ def test_retain_as_publish():
 
 def mqtt_v5_test():
     # test_message_expiry()
-    return test_session_expiry() and test_user_property() and test_shared_subscription() and test_topic_alias() and test_retain_as_publish()
+    return test_session_expiry() and test_user_property() and test_shared_subscription() and test_topic_alias() and test_topic_alias_resolution() and test_retain_as_publish()
 
