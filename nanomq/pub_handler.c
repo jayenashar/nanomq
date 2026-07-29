@@ -1674,15 +1674,14 @@ handle_pub(nano_work *work, struct pipe_content *pipe_ct, uint8_t proto,
 			}
 
 			if (len > 0 && topic != NULL) {
-				dbhash_insert_atpair(
-				    work->pid.id, alias_val, topic);
+				conn_param_set_topic_alias(
+				    work->cparam, alias_val, topic);
 			} else {
-				const char *tp = dbhash_find_atpair(
-				    work->pid.id, alias_val);
+				char *tp = conn_param_get_topic_alias(
+				    work->cparam, alias_val);
 				if (tp) {
 					topic = work->pub_packet->var_header
-					            .publish.topic_name.body =
-					    nng_strdup(tp);
+					            .publish.topic_name.body = tp;
 					len = work->pub_packet->var_header
 					          .publish.topic_name.len =
 					    strlen(tp);
