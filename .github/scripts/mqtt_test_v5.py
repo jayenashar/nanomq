@@ -275,16 +275,22 @@ def mqtt_read_packet_type(sock):
     return header[0] >> 4
 
 
-def publish_with_topic_alias(topic, alias, payload, count):
+def publish_with_topic_alias(topic, alias, payload, count, port=None,
+                             client_id="alias-resolution-pub",
+                             hard_close=False):
     """Publish count QoS 1 messages over one MQTT v5 connection. The first
     carries the topic name and registers the alias, the rest carry the alias
     and an empty topic name, so the broker has to resolve them. Neither
     mosquitto_pub nor paho can send an empty topic name, hence the raw
-    socket."""
-    sock = socket.create_connection((g_addr, g_port), timeout=10)
+    socket.
+
+    With hard_close, the socket is reset the instant the last PUBACK lands
+    instead of being closed politely, which is what lets a disconnect race
+    the publishes the broker has already acknowledged."""
+    sock = socket.create_connection((g_addr, port or g_port), timeout=30)
     try:
         connect = mqtt_utf8("MQTT") + bytes([5, 0x02]) + struct.pack("!H", 60)
-        connect += mqtt_varint(0) + mqtt_utf8("alias-resolution-pub")
+        connect += mqtt_varint(0) + mqtt_utf8(client_id)
         sock.sendall(mqtt_packet(0x10, connect))
         if mqtt_read_packet_type(sock) != 2:
             raise RuntimeError("expected CONNACK")
@@ -297,6 +303,9 @@ def publish_with_topic_alias(topic, alias, payload, count):
             sock.sendall(mqtt_packet(0x32, body))
             if mqtt_read_packet_type(sock) != 4:
                 raise RuntimeError("expected PUBACK")
+        if hard_close:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
     finally:
         sock.close()
 
@@ -343,6 +352,106 @@ def test_topic_alias_resolution():
         print("Topic alias resolution test failed!")
         return False
 
+
+g_race_port = 1893
+g_race_delay_ms = "50"
+
+
+def start_broker_with_alias_delay(conf_path, log_path, port):
+    """Start a second broker whose topic alias lookups stall, so the disconnect
+    race is wide enough to hit on purpose. The delay has to be confined to its
+    own broker, since applying it to the shared one would slow every other
+    stage down."""
+    with open(conf_path, "w") as f:
+        f.write("mqtt {\n    max_topic_alias = 1024\n}\n"
+                "listeners.tcp {\n    bind = \"0.0.0.0:%d\"\n}\n"
+                "log {\n    to = [file]\n    level = warn\n"
+                "    dir = \"%s\"\n    file = \"%s\"\n}\n"
+                % (port, os.path.dirname(log_path) or ".",
+                   os.path.basename(log_path)))
+
+    env = dict(os.environ)
+    env["NANOMQ_TEST_ALIAS_LOOKUP_DELAY_MS"] = g_race_delay_ms
+    broker = subprocess.Popen(
+        shlex.split("%s start --conf %s"
+                    % (os.environ.get("NANOMQ_BIN", "nanomq"), conf_path)),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+    for _ in range(40):
+        time.sleep(0.5)
+        try:
+            socket.create_connection((g_addr, port), timeout=1).close()
+            return broker
+        except OSError:
+            if broker.poll() is not None:
+                raise RuntimeError("delay-hook broker exited early")
+    broker.terminate()
+    raise RuntimeError("delay-hook broker never accepted connections")
+
+
+def test_topic_alias_disconnect_race():
+    # The transport PUBACKs a QoS 1 publish as soon as it reads it off the
+    # wire, before the app layer sees it, so a client can disconnect while
+    # publishes the broker has already acknowledged are still queued for a
+    # worker. Those publishes must still resolve their alias. Without the
+    # delay hook the window is a few microseconds wide and effectively
+    # untestable; with it, a broker that frees alias state on the disconnect
+    # event drops the queued publishes and kicks the pipe.
+    conf = "/tmp/nanomq_alias_race.conf"
+    log = "/tmp/nanomq_alias_race.log"
+    topic = "alias_race"
+
+    try:
+        broker = start_broker_with_alias_delay(conf, log, g_race_port)
+    except (RuntimeError, OSError) as e:
+        print("Could not start the delay-hook broker:", e)
+        print("Topic alias disconnect race test failed!")
+        return False
+
+    s_cmd = "%s -h %s -p %d -t '%s' -q 1" % (g_sub, g_addr, g_race_port, topic)
+    sub_cmd = shlex.split(s_cmd)
+    cnt = Value('i', 0)
+    pid = Value('i', 0)
+    watcher = Process(target=cnt_message, args=(sub_cmd, cnt, pid, "message"))
+    watcher.start()
+    time.sleep(2)
+
+    burst = 8
+    failure = None
+    try:
+        publish_with_topic_alias(topic, 10, b"message", burst + 1,
+                                 port=g_race_port,
+                                 client_id="alias-race-pub",
+                                 hard_close=True)
+    except (OSError, RuntimeError) as e:
+        failure = e
+
+    times = 0
+    while cnt.value != burst + 1 and times < 10:
+        time.sleep(1)
+        times += 1
+
+    watcher.terminate()
+    if pid.value:
+        os.kill(pid.value, signal.SIGKILL)
+    broker.terminate()
+    try:
+        broker.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        broker.kill()
+
+    if failure is not None:
+        print("Topic alias race publisher failed:", failure)
+    if cnt.value == burst + 1:
+        print("Topic alias disconnect race test passed!")
+        return True
+    else:
+        print("Sub client did not receive message *", burst + 1, ", only",
+              cnt.value, "received; an acknowledged publish lost its topic "
+              "alias to the disconnect")
+        print(s_cmd)
+        print("Topic alias disconnect race test failed!")
+        return False
 
 
 def test_user_property():
@@ -521,5 +630,5 @@ def test_retain_as_publish():
 
 def mqtt_v5_test():
     # test_message_expiry()
-    return test_session_expiry() and test_user_property() and test_shared_subscription() and test_topic_alias() and test_topic_alias_resolution() and test_retain_as_publish()
+    return test_session_expiry() and test_user_property() and test_shared_subscription() and test_topic_alias() and test_topic_alias_resolution() and test_topic_alias_disconnect_race() and test_retain_as_publish()
 

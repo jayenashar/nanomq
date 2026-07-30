@@ -72,4 +72,13 @@ bool check_msg_exp(nng_msg *msg, property *prop);
 reason_code handle_pub(nano_work *work, struct pipe_content *pipe_ct,
     uint8_t proto, bool is_event);
 
+// Milliseconds to stall in front of an MQTT v5 topic alias lookup. Zero in
+// every normal run. The function test suite raises it to widen the window in
+// which a publish the broker has already acknowledged is still waiting for a
+// worker while its publisher disconnects, which is otherwise far too narrow to
+// hit deliberately. Set once from the environment before the worker threads
+// start (see broker()), then only read, so it needs no synchronisation.
+extern int alias_lookup_delay_ms;
+void       alias_lookup_delay_init(void);
+
 #endif // NNG_MQTT_PUB_HANDLER_H

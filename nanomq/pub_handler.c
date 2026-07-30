@@ -8,6 +8,7 @@
 //
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(SUPP_MYSQL)
@@ -38,6 +39,26 @@
 #if defined(SUPP_PLUGIN)
 	#include "include/plugin.h"
 #endif
+
+int alias_lookup_delay_ms = 0;
+
+// alias_lookup_delay_init reads the test hook's delay out of the environment.
+// Called from broker() before any worker thread exists, so the plain int above
+// is written once and read-only afterwards.
+void
+alias_lookup_delay_init(void)
+{
+	const char *delay = getenv("NANOMQ_TEST_ALIAS_LOOKUP_DELAY_MS");
+
+	if (delay != NULL) {
+		alias_lookup_delay_ms = atoi(delay);
+		if (alias_lookup_delay_ms > 0) {
+			log_warn("TEST HOOK: stalling %d ms before every MQTT "
+			         "v5 topic alias lookup",
+			    alias_lookup_delay_ms);
+		}
+	}
+}
 
 #define ENABLE_RETAIN 1
 #define SUPPORT_MQTT5_0 1
@@ -1677,6 +1698,9 @@ handle_pub(nano_work *work, struct pipe_content *pipe_ct, uint8_t proto,
 				conn_param_set_topic_alias(
 				    work->cparam, alias_val, topic);
 			} else {
+				if (alias_lookup_delay_ms > 0) {
+					nng_msleep(alias_lookup_delay_ms);
+				}
 				char *tp = conn_param_get_topic_alias(
 				    work->cparam, alias_val);
 				if (tp) {

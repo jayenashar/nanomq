@@ -1033,6 +1033,8 @@ broker(conf *nanomq_conf)
 #endif
 	// init hash seed first.
 	nanomq_init_hash_seed();
+	// read the topic alias test hook while we are still single threaded
+	alias_lookup_delay_init();
 	// init tree
 	dbtree_create(&db);
 	if (db == NULL) {
